@@ -37,17 +37,64 @@ cv2.putText(img, "txt", (x,y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, th)   # y
 - Colour mask: `cv2.inRange(hsv, lower, upper)` → 255 inside range
 - Blank canvas: `np.zeros((h, w, 3), np.uint8)`
 
-## Intensity / enhancement
+## Photometric / point transformations
+Point op: output pixel depends only on the **same input pixel**, `s = T(r)` (r = input, s = output, L = 256 levels). Always work in float, then `np.clip(s,0,255).astype(np.uint8)`.
+
+| Op | Formula | Code |
+|---|---|---|
+| Negative | `s = 255 − r` | `255 - g` or `cv2.bitwise_not(g)` |
+| Linear (contrast/brightness) | `s = α·r + β` | `cv2.convertScaleAbs(g, alpha=1.3, beta=20)` |
+| **Log** | `s = c·log(1+r)`, `c = 255/log(1+max)` | `c = 255/np.log(1+g.max()); s = c*np.log(1+g.astype(np.float32))` |
+| **Inverse log** | `s = exp(r/c) − 1` | opposite of log: compresses brights, expands darks |
+| **Gamma (power)** | `s = c·r^γ` (r normalised to [0,1]) | `s = 255*(g/255.0)**gamma` or `np.power(g/255.0, gamma)*255` |
+| LUT (fast, any curve) | `s = table[r]` | `lut = np.array([255*(i/255)**γ for i in range(256)], np.uint8); cv2.LUT(g, lut)` |
+
+- **Log:** expands dark values, compresses bright ones. Use on images with huge dynamic range (e.g. Fourier spectrum) or dark images. Larger `c` ⇒ brighter. Result is nonlinear: `r=0 → 0`, `r=max → 255`.
+- **Gamma:** `γ < 1` → brightens (expands darks, like log) · `γ > 1` → darkens (expands brights) · `γ = 1` identity. Use γ<1 for washed-out/dark images, γ>1 for over-exposed. Corrects display/monitor gamma (≈2.2).
+- Log vs gamma: log has a fixed curve shape; gamma family gives a whole range of curves via `γ`.
+
+### Piecewise-linear (contrast stretching, thresholding, slicing)
+```python
+# Contrast stretching: map [r1, r2] -> [s1, s2], linear in 3 segments
+def stretch(g, r1, s1, r2, s2):
+    g = g.astype(np.float32)
+    out = np.where(g < r1, g * (s1/r1),
+          np.where(g <= r2, (g-r1) * (s2-s1)/(r2-r1) + s1,
+                            (g-r2) * (255-s2)/(255-r2) + s2))
+    return np.clip(out, 0, 255).astype(np.uint8)
+# Min-max stretch (full range):  cv2.normalize(g, None, 0, 255, cv2.NORM_MINMAX)
+# Equivalent via np.interp:      np.interp(g, [0, r1, r2, 255], [0, s1, s2, 255]).astype(np.uint8)
+```
+- Typical choice: `r1 = min, r2 = max, s1 = 0, s2 = 255` (full stretch); `(r1,s1)=(r2,s2)` ⇒ **thresholding** (binary output).
+- **Gray-level slicing:** highlight range `[A, B]`: `s = 255 if A<=r<=B else r` (keep background) or `else 0` (binary). `np.where((g>=A)&(g<=B), 255, g)`
+- **Bit-plane slicing:** `(g >> k) & 1` · MSB planes carry most visual info.
+- Slope >1 ⇒ contrast increased in that range; slope <1 ⇒ compressed.
+
+### Histogram
+| Task | Code |
+|---|---|
+| Compute | `h = cv2.calcHist([g],[0],None,[256],[0,256])` (shape 256×1) · or `np.bincount(g.ravel(), minlength=256)` |
+| Plot | `plt.hist(g.ravel(), 256, (0,256))` · or `plt.plot(h)` |
+| Colour (per channel) | `for i,c in enumerate("bgr"): plt.plot(cv2.calcHist([img],[i],None,[256],[0,256]), c)` |
+| Normalised (PDF) | `p = h / h.sum()` · CDF: `np.cumsum(p)` |
+| Equalise (gray) | `cv2.equalizeHist(g)` |
+| Equalise (colour) | convert to YCrCb/HSV, equalise **Y/V only**, convert back: `y,cr,cb = cv2.split(cv2.cvtColor(img,cv2.COLOR_BGR2YCrCb)); cv2.merge([cv2.equalizeHist(y),cr,cb])` |
+| CLAHE (local, limited) | `cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(g)` |
+| Specification / matching | map CDF of source to CDF of target: `np.interp(cdf_src, cdf_ref, levels)` (skimage: `match_histograms`) |
+| Mask histogram | `cv2.calcHist([g],[0],mask,[256],[0,256])` |
+
+- **Reading a histogram:** mass on left = dark · right = bright · narrow = low contrast · wide/flat = high contrast · bimodal = object+background (→ Otsu).
+- **Equalisation:** `s_k = round(255 · CDF(r_k))` → spreads intensities to a ~flat histogram, boosts global contrast. Weakness: amplifies noise, can wash out; **CLAHE** fixes this with per-tile equalisation + clip limit (higher clip = more contrast/noise).
+- Equalisation is **not invertible** and output histogram is only approximately flat (discrete levels).
+- Manual equalisation: `cdf = h.cumsum(); lut = np.round((cdf-cdf.min())/(cdf.max()-cdf.min())*255).astype(np.uint8); out = lut[g]`
+
+### Other enhancement
 | Op | Code |
 |---|---|
-| Hist. equalisation (gray) | `cv2.equalizeHist(g)` |
-| CLAHE | `cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(g)` |
 | Colormap | `cv2.applyColorMap(g_uint8, cv2.COLORMAP_JET)` (BONE, HOT, ...) |
-| Log | `c = 255/np.log(1+g.max()); s = c*np.log(1+g.astype(float))` → clip, uint8 |
-| Gamma | `s = (255*(g/255.0)**γ).astype(np.uint8)` (γ<1 brightens) |
-| Negative | `255 - g` |
-| Histogram | `cv2.calcHist([g],[0],None,[256],[0,256])` or `plt.hist(g.ravel(),256,(0,256))` |
 | Grey-world balance | scale each channel by `mean_gray / mean_channel` |
+
+**Which transform?** Dark image → gamma<1 / log · washed-out/bright → gamma>1 · low contrast → contrast stretch or equalisation · uneven local contrast → CLAHE · huge dynamic range (spectrum) → log · specific intensity band → slicing · need custom curve → piecewise or LUT.
 
 ## Filtering
 `cv2.blur(img,(k,k))` · `cv2.GaussianBlur(img,(k,k),0)` (k odd) · `cv2.medianBlur(img,k)` (salt & pepper) · `cv2.bilateralFilter(img,9,75,75)` (edge-preserving) · `cv2.filter2D(img,-1,kernel)` · `cv2.Sobel(g, cv2.CV_64F, 1, 0)` · `cv2.Laplacian(g, cv2.CV_64F)`
